@@ -44,6 +44,8 @@ from swesmith.issue_gen.utils import get_test_function
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 litellm.suppress_debug_info = True
 
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+AZURE_AD_TOKEN_PROVIDER = get_bearer_token_provider(DefaultAzureCredential(), os.getenv("AZURE_API_SCOPE", None))
 
 TEST_SRC_CODE_PROMPT = r"""
 **Test Source Code:**
@@ -112,7 +114,8 @@ class IssueGen:
         # Get execution output from running pytest for this instance (from validation step)
         test_output = (
             LOG_DIR_RUN_VALIDATION
-            / instance["repo"].split("/")[-1]
+            # / instance["repo"].split("/")[-1]
+            / self.experiment_id
             / instance[KEY_INSTANCE_ID]
             / LOG_TEST_OUTPUT
         ).read_text()
@@ -227,7 +230,7 @@ class IssueGen:
 
         # Generate n_instructions completions containing problem statements
         response = completion(
-            model=self.model, messages=messages, n=self.n_instructions, temperature=0
+            model=self.model, messages=messages, n=self.n_instructions, azure_ad_token_provider=AZURE_AD_TOKEN_PROVIDER,
         )
         metadata = {
             "responses": {},
