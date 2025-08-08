@@ -229,9 +229,33 @@ class IssueGen:
             json.dump(messages, f_, indent=4)
 
         # Generate n_instructions completions containing problem statements
-        response = completion(
-            model=self.model, messages=messages, n=self.n_instructions, azure_ad_token_provider=AZURE_AD_TOKEN_PROVIDER,
-        )
+
+        if self.model.startswith("capi-"):
+            # Import the capi API method
+            try:
+                import sys
+                from pathlib import Path
+                sys.path.append(str(Path.home() / "1" / "cai"))
+                from capi import query_capi
+                CAPI_AVAILABLE = True
+            except ImportError:
+                CAPI_AVAILABLE = False
+                query_capi = None
+            # Use custom API implementation
+            if not CAPI_AVAILABLE:
+                raise ImportError(
+                    f"Model {self.model} requires capi.py module at ~/1/cai/capi.py, "
+                    "but it could not be imported. Please implement the capi.py module."
+                )
+            # Call the custom query_capi function
+            response = query_capi(
+                use_model=self.model.split("capi-",maxsplit=1)[1],
+                messages=messages,
+            )
+        else:
+            response = completion(
+                model=self.model, messages=messages, n=self.n_instructions, azure_ad_token_provider=AZURE_AD_TOKEN_PROVIDER,
+            )
         metadata = {
             "responses": {},
             "cost": completion_cost(response),
