@@ -258,7 +258,7 @@ class IssueGen:
             )
         metadata = {
             "responses": {},
-            "cost": completion_cost(response),
+            "cost": 0.0  # completion_cost(response),
         }
 
         # Extract problem statements from completions
