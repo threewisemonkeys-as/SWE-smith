@@ -1,16 +1,17 @@
 import libcst
 
-from swesmith.bug_gen.procedural import PythonProceduralModifier
-from swesmith.constants import CodeProperty
+from swesmith.bug_gen.procedural import BaseProceduralModifier
+from swesmith.bug_gen.criteria import *
 
 
-class RemoveLoopModifier(PythonProceduralModifier):
+class RemoveLoopModifier(BaseProceduralModifier):
     explanation: str = "There is one or more missing loops that is causing the bug."
     name: str = "func_pm_remove_loop"
     conditions: list = [
-        CodeProperty.IS_FUNCTION,
-        CodeProperty.HAS_LOOP,
-    ]
+        filter_functions,
+        filter_loops,
+        filter_min_simple_complexity,
+    ]  # Assuming filter functions will be applied externally
 
     def leave_For(self, original_node, updated_node):
         return libcst.RemoveFromParent() if self.flip() else updated_node
@@ -19,24 +20,26 @@ class RemoveLoopModifier(PythonProceduralModifier):
         return libcst.RemoveFromParent() if self.flip() else updated_node
 
 
-class RemoveConditionalModifier(PythonProceduralModifier):
+class RemoveConditionalModifier(BaseProceduralModifier):
     explanation: str = "There is one or more missing conditionals that causes the bug."
     name: str = "func_pm_remove_cond"
     conditions: list = [
-        CodeProperty.IS_FUNCTION,
-        CodeProperty.HAS_IF,
+        filter_functions,
+        filter_conditionals,
+        filter_min_simple_complexity,
     ]
 
     def leave_If(self, original_node, updated_node):
         return libcst.RemoveFromParent() if self.flip() else updated_node
 
 
-class RemoveAssignModifier(PythonProceduralModifier):
+class RemoveAssignModifier(BaseProceduralModifier):
     explanation: str = "There is likely a missing assignment in the code."
     name: str = "func_pm_remove_assign"
     conditions: list = [
-        CodeProperty.IS_FUNCTION,
-        CodeProperty.HAS_ASSIGNMENT,
+        filter_functions,
+        filter_assignments,
+        filter_min_simple_complexity,
     ]
 
     def leave_Assign(self, original_node, updated_node):
@@ -46,13 +49,10 @@ class RemoveAssignModifier(PythonProceduralModifier):
         return libcst.RemoveFromParent() if self.flip() else updated_node
 
 
-class RemoveWrapperModifier(PythonProceduralModifier):
+class RemoveWrapperModifier(BaseProceduralModifier):
     explanation: str = "There are missing wrappers (with, try blocks) in the code."
     name: str = "func_pm_remove_wrapper"
-    conditions: list = [
-        CodeProperty.IS_FUNCTION,
-        CodeProperty.HAS_WRAPPER,
-    ]
+    conditions: list = [filter_functions, filter_wrappers, filter_min_simple_complexity]
 
     def leave_With(self, original_node, updated_node):
         return libcst.RemoveFromParent() if self.flip() else updated_node

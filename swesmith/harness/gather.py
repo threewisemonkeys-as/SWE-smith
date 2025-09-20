@@ -5,11 +5,12 @@ that can be run with SWE-agent. Each instances is of the form:
 {
     "instance_id":
     "repo":
+    "base_commit":
     "patch":
-    "test_patch":
     "problem_statement":
     "FAIL_TO_PASS":
     "PASS_TO_PASS":
+    "created_at":
     "version":
 }
 
@@ -32,6 +33,9 @@ import os
 import shutil
 import subprocess
 
+from datetime import datetime
+from dotenv import load_dotenv
+from ghapi.all import GhApi
 from pathlib import Path
 from swebench.harness.constants import (
     FAIL_TO_PASS,
@@ -45,10 +49,14 @@ from swesmith.constants import (
     KEY_PATCH,
     KEY_TIMED_OUT,
     LOG_DIR_TASKS,
+    ORG_NAME,
     REF_SUFFIX,
 )
-from swesmith.profiles import global_registry
+from swesmith.utils import clone_repo, get_full_commit, get_image_name, get_repo_name
 from tqdm.auto import tqdm
+
+load_dotenv()
+api = GhApi(token=os.getenv("GITHUB_TOKEN"))
 
 FAILURE_TIPS = """
 IMPORTANT
@@ -82,7 +90,7 @@ def main(*args, **kwargs):
         raise
 
 
-def skip_print(reason: str, pbar: tqdm, stats: dict, verbose: bool):
+def skip_print(reason, pbar, stats, verbose):
     stats["skipped"] += 1
     pbar.set_postfix(stats)
     if verbose:
@@ -92,33 +100,39 @@ def skip_print(reason: str, pbar: tqdm, stats: dict, verbose: bool):
 
 
 def check_if_branch_exists(
-    repo_name: str,
-    subfolder: str,
-    main_branch: str,
-    override_branch: bool,
-    verbose: bool,
+    api, repo_name, subfolder, main_branch, override_branch, verbose
 ):
     branch_exists = None
+    branch_commit = None
     try:
-        subprocess.run(f"git checkout {subfolder}", cwd=repo_name, **SUBPROCESS_ARGS)
+        api.repos.get_branch(ORG_NAME, repo_name, subfolder)
+        subprocess.run(f"cd {repo_name}; git checkout {subfolder}", **SUBPROCESS_ARGS)
         if override_branch:
             # Delete the branch remotely
             subprocess.run(
-                f"git push --delete origin {subfolder}",
-                cwd=repo_name,
+                f"cd {repo_name}; git push --delete origin {subfolder}",
                 **SUBPROCESS_ARGS,
             )
             if verbose:
                 print(f"[{subfolder}] Overriding existing branch")
             branch_exists = False
         else:
+            branch_commit = (
+                subprocess.run(
+                    f"cd {repo_name}; git rev-parse HEAD",
+                    capture_output=True,
+                    **SUBPROCESS_ARGS,
+                )
+                .stdout.decode()
+                .strip()
+            )
             branch_exists = True
-        subprocess.run(f"git checkout {main_branch}", cwd=repo_name, **SUBPROCESS_ARGS)
-        subprocess.run(f"git branch -D {subfolder}", cwd=repo_name, **SUBPROCESS_ARGS)
+        subprocess.run(f"cd {repo_name}; git checkout {main_branch}", **SUBPROCESS_ARGS)
+        subprocess.run(f"cd {repo_name}; git branch -D {subfolder}", **SUBPROCESS_ARGS)
     except Exception:
         branch_exists = False
         pass
-    return branch_exists
+    return branch_exists, branch_commit
 
 
 def _main(
@@ -126,7 +140,6 @@ def _main(
     *,
     debug_subprocess: bool = False,
     override_branch: bool = False,
-    repush_image: bool = False,
     verbose: bool = False,
 ):
     """
@@ -156,17 +169,16 @@ def _main(
     task_instances_path = LOG_DIR_TASKS / f"{run_id}.json"
     print(f"Out Path: {task_instances_path}")
     task_instances = []
-    created_repos = set()
+    created_repos = []
 
     completed_ids = []
     subfolders = os.listdir(validation_logs_path)
-    if not override_branch and os.path.exists(task_instances_path):
-        with open(task_instances_path) as f:
-            task_instances = [
-                x
-                for x in json.load(f)
-                if x[KEY_INSTANCE_ID] in subfolders  # Omits removed bugs
-            ]
+    if os.path.exists(task_instances_path):
+        task_instances = [
+            x
+            for x in json.load(open(task_instances_path))
+            if x[KEY_INSTANCE_ID] in subfolders  # Omits removed bugs
+        ]
         completed_ids = [x[KEY_INSTANCE_ID] for x in task_instances]
         print(f"Found {len(task_instances)} existing task instances")
         subfolders = [x for x in subfolders if x not in completed_ids]
@@ -187,8 +199,7 @@ def _main(
             stats = skip_print(f"{subfolder}: No results", pbar, stats, verbose)
             continue
 
-        with open(path_results) as f:
-            results = json.load(f)
+        results = json.load(open(path_results))
         if FAIL_TO_PASS not in results or PASS_TO_PASS not in results:
             stats = skip_print(
                 f"{subfolder}: No validatable bugs", pbar, stats, verbose
@@ -210,25 +221,30 @@ def _main(
             )
             continue
 
-        with open(path_patch) as f:
-            patch_content = f.read()
+        repo = subfolder.rsplit(".", 2)[0].replace("__", "/")
+        commit = get_full_commit(repo, subfolder.rsplit(".", 2)[1])
+        repo_name = repo.split("/")[1]
+
+        # Create repository if it doesn't exist
+        repo_name = get_repo_name(repo, commit)
+
         task_instance = {
             KEY_INSTANCE_ID: subfolder,
-            KEY_PATCH: patch_content,
+            "repo": f"{ORG_NAME}/{repo_name}",
+            KEY_PATCH: open(path_patch).read(),
             FAIL_TO_PASS: results[FAIL_TO_PASS],
             PASS_TO_PASS: results[PASS_TO_PASS],
+            "created_at": datetime.now().isoformat(),
+            KEY_IMAGE_NAME: get_image_name(repo, commit),
         }
-        rp = global_registry.get_from_inst(task_instance)
-        task_instance[KEY_IMAGE_NAME] = rp.image_name
-        task_instance["repo"] = rp.mirror_name
 
         # Clone repository
-        if rp.clone():
-            created_repos.add(rp.repo_name)
+        cloned = clone_repo(repo_name)
+        if cloned:
+            created_repos.append(repo_name)
         main_branch = (
             subprocess.run(
-                "git rev-parse --abbrev-ref HEAD",
-                cwd=rp.repo_name,
+                f"cd {repo_name}; git rev-parse --abbrev-ref HEAD",
                 capture_output=True,
                 shell=True,
                 check=True,
@@ -238,13 +254,14 @@ def _main(
         )
 
         # Check if branch already created for this problem
-        branch_exists = check_if_branch_exists(
-            rp.repo_name, subfolder, main_branch, override_branch, verbose
+        branch_exists, branch_commit = check_if_branch_exists(
+            api, repo_name, subfolder, main_branch, override_branch, verbose
         )
         if branch_exists:
+            task_instance["base_commit"] = branch_commit
             task_instances.append(task_instance)
             stats = skip_print(
-                f"{subfolder}: Branch `{subfolder}` exists",
+                f"{subfolder}: Already exists @ branch `{subfolder}` {branch_commit[:8]}",
                 pbar,
                 stats,
                 verbose,
@@ -257,8 +274,7 @@ def _main(
         applied = False
         for git_apply in GIT_APPLY_CMDS:
             output = subprocess.run(
-                f"{git_apply} ../{path_patch}",
-                cwd=rp.repo_name,
+                f"cd {repo_name}; {git_apply} ../{path_patch}",
                 capture_output=True,
                 shell=True,
             )
@@ -267,64 +283,42 @@ def _main(
                 break
             else:
                 # Remove any artifacts
-                subprocess.run("git reset --hard", cwd=rp.repo_name, **SUBPROCESS_ARGS)
+                subprocess.run(f"cd {repo_name}; git reset --hard", **SUBPROCESS_ARGS)
         if not applied:
-            raise Exception(f"[{subfolder}] Failed to apply patch to {rp.repo_name}")
+            raise Exception(f"[{subfolder}] Failed to apply patch to {repo_name}")
         if verbose:
             print(f"[{subfolder}] Bug patch applied successfully")
 
         # Create a branch, check it out, commit, push the branch, and cleanup
         cmds = [
-            "git config user.email 'swesmith@swesmith.ai'",
-            "git config user.name 'swesmith'",
-            "git config commit.gpgsign false",
-            f"git checkout -b {subfolder}",
-            "git add .",
-            "git commit --no-gpg-sign -m 'Bug Patch'",
+            f"cd {repo_name}; git config user.email 'swesmith@swesmith.ai'",
+            f"cd {repo_name}; git config user.name 'swesmith'",
+            f"cd {repo_name}; git config commit.gpgsign false",
+            f"cd {repo_name}; git checkout -b {subfolder}",
+            f"cd {repo_name}; git add .",
+            f"cd {repo_name}; git commit -m 'Bug Patch'",
+            f"cd {repo_name}; git push origin {subfolder}",
+            f"cd {repo_name}; git rev-parse HEAD",
+            f"cd {repo_name}; git checkout {main_branch}",
+            f"cd {repo_name}; git reset --hard",
+            f"cd {repo_name}; git branch -D {subfolder}",
         ]
+        bug_commit = None
         for cmd in cmds:
             if debug_subprocess:
-                print(f"[{subfolder}] {cmd}")
-            subprocess.run(cmd, cwd=rp.repo_name, **SUBPROCESS_ARGS)
-
-        # Create test patch by removing F2P test files
-        f2p_test_files = rp.get_f2p_test_files(task_instance)
-        if f2p_test_files:
-            # Remove the test files
-            for test_file in f2p_test_files:
-                test_file_path = os.path.join(rp.repo_name, test_file)
-                if os.path.exists(test_file_path):
-                    os.remove(test_file_path)
-                    if verbose:
-                        print(f"[{subfolder}] Removed F2P test file: {test_file}")
-
-            # Add and commit removal
-            cmds = [
-                "git add .",
-                "git commit --no-gpg-sign -m 'Remove F2P Tests'",
-            ]
-            for cmd in cmds:
-                if debug_subprocess:
-                    print(f"[{subfolder}] {cmd}")
-                subprocess.run(cmd, cwd=rp.repo_name, **SUBPROCESS_ARGS)
-            if verbose:
-                print(f"[{subfolder}] Commit F2P test file(s) removal")
-        elif verbose:
-            print(f"[{subfolder}] No test files to remove")
-
-        cmds = [
-            f"git push origin {subfolder}",
-            f"git checkout {main_branch}",
-            "git reset --hard",
-            f"git branch -D {subfolder}",
-        ]
-        for cmd in cmds:
-            if debug_subprocess:
-                print(f"[{subfolder}] {cmd}")
-            subprocess.run(cmd, cwd=rp.repo_name, **SUBPROCESS_ARGS)
+                print(f"[{subfolder}] Running: {cmd}")
+            if cmd.endswith("git rev-parse HEAD"):
+                bug_commit = (
+                    subprocess.run(cmd, capture_output=True, shell=True, check=True)
+                    .stdout.decode()
+                    .strip()
+                )
+            else:
+                subprocess.run(cmd, **SUBPROCESS_ARGS)
         if verbose:
-            print(f"[{subfolder}] Bug @ branch `{subfolder}`")
+            print(f"[{subfolder}] Bug @ branch `{subfolder}` {bug_commit[:8]}")
 
+        task_instance["base_commit"] = bug_commit
         task_instances.append(task_instance)
         if verbose:
             print(f"[{subfolder}] Created task instance")
@@ -336,10 +330,7 @@ def _main(
         print("Cleaning up...")
         for repo in created_repos:
             shutil.rmtree(repo)
-            print(f"[{repo}] Removed local clone")
-            if repush_image:
-                print(f"[{repo}] Rebuilding + pushing image")
-                global_registry.get(repo).push_image(rebuild_image=True)
+            print(f"Removed {repo}")
 
     task_instances_path.parent.mkdir(parents=True, exist_ok=True)
     with open(task_instances_path, "w") as f:
@@ -357,7 +348,6 @@ if __name__ == "__main__":
         "validation_logs_path", type=str, help="Path to the validation logs"
     )
     parser.add_argument(
-        "-v",
         "--verbose",
         action="store_true",
         help="Verbose mode",
@@ -368,22 +358,14 @@ if __name__ == "__main__":
     # In this case, we delete the branch and recreate the bug.
     # This is useful for if you've regenerated a bug, it's validated, and you'd like to override the existing branch.
     parser.add_argument(
-        "-o",
         "--override_branch",
         action="store_true",
         help="Override existing branches",
     )
     parser.add_argument(
-        "-d",
         "--debug_subprocess",
         action="store_true",
         help="Debug mode (output subprocess output)",
-    )
-    parser.add_argument(
-        "-p",
-        "--repush_image",
-        action="store_true",
-        help="Rebuild and push Docker image for repos (such that latest branches are included)",
     )
     args = parser.parse_args()
 

@@ -1,8 +1,13 @@
 import docker
+import os
+import re
+import shutil
 import traceback
 
 from docker.models.containers import Container
+from functools import lru_cache
 from logging import Logger
+from multiprocessing import Lock
 from pathlib import Path
 from swebench.harness.constants import (
     APPLY_PATCH_FAIL,
@@ -10,6 +15,7 @@ from swebench.harness.constants import (
     DOCKER_PATCH,
     DOCKER_USER,
     DOCKER_WORKDIR,
+    FAIL_TO_PASS,
     KEY_INSTANCE_ID,
     LOG_INSTANCE,
     LOG_TEST_OUTPUT,
@@ -24,14 +30,155 @@ from swebench.harness.docker_utils import (
     exec_run_with_timeout,
 )
 from swebench.harness.utils import EvaluationError
+from swesmith.bug_gen.mirror.generate import INSTANCE_REF
 from swesmith.constants import (
+    ENV_NAME,
     GIT_APPLY_CMDS,
+    KEY_IMAGE_NAME,
+    KEY_MIN_TESTING,
+    KEY_PATCH,
+    KEY_TEST_CMD,
     LOG_DIR_RUN_VALIDATION,
+    MAP_REPO_TO_SPECS,
     TEST_OUTPUT_END,
     TEST_OUTPUT_START,
+    TIMEOUT,
 )
-from swesmith.profiles import global_registry
+from swesmith.utils import (
+    clone_repo,
+    get_repo_commit_from_image_name,
+    get_repo_name,
+    get_test_paths,
+)
 from unidiff import PatchSet
+
+
+repo_lock = Lock()
+
+
+@lru_cache(maxsize=None)
+def get_cached_test_paths(repo_name):
+    with repo_lock:  # Only one process enters this block at a time
+        if not os.path.exists(repo_name):
+            clone_repo(repo_name)
+
+        test_paths = get_test_paths(repo_name)
+
+        if os.path.exists(repo_name):
+            shutil.rmtree(repo_name)
+
+    return test_paths
+
+
+def get_test_command_mypy(instance: dict):
+    repo, commit = get_repo_commit_from_image_name(instance[KEY_IMAGE_NAME])
+    pattern = r"\[case ([^\]]+)\]"
+    if FAIL_TO_PASS in instance:
+        test_keys = " or ".join([x.rsplit("::", 1)[-1] for x in instance[FAIL_TO_PASS]])
+    elif INSTANCE_REF in instance and "test_patch" in instance[INSTANCE_REF]:
+        test_keys = " or ".join(
+            re.findall(pattern, instance[INSTANCE_REF]["test_patch"])
+        )
+    return f'{MAP_REPO_TO_SPECS[repo][commit][KEY_TEST_CMD]} "{test_keys}"'
+
+
+MAP_REPO_TO_TEST_CMD = {
+    "python/mypy": get_test_command_mypy,
+}
+
+
+def get_test_command(instance: dict):
+    """
+    Given a repo/commit pair and a (gold) patch, return the test command to run
+    """
+    repo, commit = get_repo_commit_from_image_name(instance[KEY_IMAGE_NAME])
+    specs = MAP_REPO_TO_SPECS[repo][commit]
+    test_command = specs[KEY_TEST_CMD]
+
+    if FAIL_TO_PASS in instance and "pytest" in specs[KEY_TEST_CMD]:
+        # NOTE: Using F2P key as indicator that this is eval instance, not validation
+        if repo in MAP_REPO_TO_TEST_CMD:
+            return MAP_REPO_TO_TEST_CMD[repo](instance), []
+        f2p_files = list(set([x.split("::", 1)[0] for x in instance[FAIL_TO_PASS]]))
+        test_command += f" {' '.join(f2p_files)}"
+        return test_command, f2p_files
+
+    if KEY_MIN_TESTING not in specs or KEY_PATCH not in instance:
+        # If min testing is not enabled or there's no patch
+        # return test command as is (usually = run whole test suite)
+        return test_command, []
+
+    # Get all testing related file paths in the repo
+    test_paths = get_cached_test_paths(get_repo_name(repo, commit))
+
+    if (
+        INSTANCE_REF in instance
+        and len(instance[INSTANCE_REF]["test_patch"].strip()) > 0
+    ):
+        test_patch = instance[INSTANCE_REF]["test_patch"]
+        # For PR Mirroring (SWE-bench style) instances,
+        # if test patch is available, use that information
+        if repo in MAP_REPO_TO_TEST_CMD:
+            return MAP_REPO_TO_TEST_CMD[repo](instance), []
+        rv = []
+        for x in PatchSet(test_patch):
+            for test_path in test_paths:
+                if str(test_path).endswith(x.path) or str(test_path).endswith(
+                    Path(x.path).name
+                ):
+                    rv.append(str(test_path))
+        if len(rv) > 0:
+            test_command += f" {' '.join(rv)}"
+            return test_command, rv
+
+    # Identify relevant test files based on the patch
+    patch_paths = [Path(f.path) for f in PatchSet(instance[KEY_PATCH])]
+    rv = []
+    for patch_path in patch_paths:
+        file_name = patch_path.name.strip(".py")
+        parent_dir = patch_path.parent.name
+        for test_path in test_paths:
+            # Check for common test file naming conventions first
+            # If found, add to list and break
+            common_test_names = [
+                f"test_{file_name}.py",
+                f"test{file_name}.py",
+                f"{file_name}_test.py",
+                f"{file_name}test.py",
+            ]
+            if any(
+                [
+                    str(test_path).endswith(f"{parent_dir}/{name}")
+                    or str(test_path).endswith(name)
+                    for name in common_test_names
+                ]
+            ):
+                rv.append(str(test_path))
+                break
+        else:
+            for test_path in test_paths:
+                if parent_dir == test_path.parent.name:
+                    # If similar testing folder found, add to list and break
+                    rv.append(str(test_path.parent))
+                    break
+                elif any(
+                    [
+                        x.format(parent_dir) == test_path.name
+                        for x in ["test_{}.py", "test{}.py", "{}_test.py", "{}test.py"]
+                    ]
+                ):
+                    rv.append(str(test_path))
+
+    if len(rv) > 0:
+        # Remove duplicates
+        test_files = [x for x in rv if x.endswith(".py")]
+        final = [x for x in rv if not x.endswith(".py")]
+        for test_file in test_files:
+            if os.path.dirname(test_file) not in final:
+                final.append(test_file)
+        test_command += f" {' '.join(set(final))}"
+
+    return test_command, rv
 
 
 def _apply_patch(
@@ -69,11 +216,10 @@ def run_patch_in_container(
     instance: dict,
     run_id: str,
     log_dir: Path,
-    timeout: int,
     patch: str | None = None,
     commit: str | None = None,
-    f2p_only: bool = False,
     is_gold: bool = False,
+    timeout: int = TIMEOUT,
 ) -> tuple[Logger, bool] | None:
     """
     Run a patch in a container. The general logical flow is as follows:
@@ -90,11 +236,10 @@ def run_patch_in_container(
     container = None
     client = docker.from_env()
     instance_id = instance[KEY_INSTANCE_ID]
-    rp = global_registry.get_from_inst(instance)
-    is_eval = log_dir == RUN_EVALUATION_LOG_DIR
+    image_name = instance[KEY_IMAGE_NAME]
     try:
         container_type = None
-        if is_eval:
+        if log_dir == RUN_EVALUATION_LOG_DIR:
             container_type = "eval"
         elif log_dir == LOG_DIR_RUN_VALIDATION:
             container_type = "val"
@@ -108,7 +253,7 @@ def run_patch_in_container(
 
         # Start docker container
         container = client.containers.create(
-            image=rp.image_name,
+            image=image_name,
             name=container_name,
             user=DOCKER_USER,
             detach=True,
@@ -128,57 +273,25 @@ def run_patch_in_container(
             if val.exit_code != 0:
                 logger.info(f"CHECKOUT FAILED: {val.output.decode(UTF8)}")
                 return logger, False
-            if is_eval:
-                # NOTE: Key assumption we make is that each branch has two commits
-                # 1. Bug commit
-                # 2. F2P Test File(s) removal commit (on top of 1).
-                # The `HEAD~1` corresponds to reverting the branch to (1), which
-                # effectively brings the tests back into the codebase.
-                val = container.exec_run(
-                    "git checkout HEAD~1", workdir=DOCKER_WORKDIR, user=DOCKER_USER
-                )
-                if val.exit_code != 0:
-                    logger.info(
-                        f"CHECKOUT TO BUG STAGE FAILED: {val.output.decode(UTF8)}"
-                    )
-                    return logger, False
 
         # If provided, copy patch to container and apply it to codebase
-        if patch is not None and len(patch) >= 1:
-            logger.info("Applying patch to container...")
-
-            # Revert any changes to those files in the container to ensure a clean state
-            changed_files = " ".join([x.path for x in PatchSet(patch)])
-            container.exec_run(
-                f"git checkout -- {changed_files}",
-                workdir=DOCKER_WORKDIR,
-                user=DOCKER_USER,
-            )
-
-            # Apply the patch inside the container
+        if patch is not None:
             patch_file = Path(log_dir / "patch.diff")
             patch_file.write_text(patch)
             logger.info(f"Patch written to {patch_file}, now applying to container...")
             copy_to_container(container, patch_file, Path(DOCKER_PATCH))
             _apply_patch(instance_id, container, logger, is_gold)
 
-            if is_eval:
-                # For evaluation, removes any changes to F2P test related files.
-                test_files = " ".join(rp.get_f2p_test_files(instance))
-                container.exec_run(
-                    f"git checkout -- {test_files}",
-                    workdir=DOCKER_WORKDIR,
-                    user=DOCKER_USER,
-                )
-
         # Copy eval script to container
         eval_file = Path(log_dir / "eval.sh")
-        test_command, _ = rp.get_test_cmd(instance, f2p_only=f2p_only)
+        test_command, _ = get_test_command(instance)
         eval_file.write_text(
             "\n".join(
                 [
                     "#!/bin/bash",
                     "set -uxo pipefail",
+                    "source /opt/miniconda3/bin/activate",
+                    f"conda activate {ENV_NAME}",
                     f"cd {DOCKER_WORKDIR}",
                     f": '{TEST_OUTPUT_START}'",
                     test_command,

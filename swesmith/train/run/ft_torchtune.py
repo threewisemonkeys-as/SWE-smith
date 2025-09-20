@@ -9,6 +9,8 @@ import os
 import modal
 import yaml
 
+from swesmith.constants import VOLUME_NAME_DATASET, VOLUME_NAME_MODEL
+
 torchtune_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
@@ -25,8 +27,8 @@ torchtune_image = (
 
 
 app = modal.App("torchtune-training")
-trained_model_volume = modal.Volume.from_name("weights", create_if_missing=True)
-dataset_volume = modal.Volume.from_name("data", create_if_missing=True)
+trained_model_volume = modal.Volume.from_name(VOLUME_NAME_MODEL, create_if_missing=True)
+dataset_volume = modal.Volume.from_name(VOLUME_NAME_DATASET, create_if_missing=True)
 
 MINUTES = 60  # seconds
 HOURS = 60 * MINUTES
@@ -39,8 +41,8 @@ N_HOURS = int(os.environ.get("N_HOURS", 10))
     # gpu=modal.gpu.A100(count=N_GPU, size="80GB"),
     gpu=f"H100:{N_GPUS}",
     volumes={
-        "/weights": trained_model_volume,
-        "/data": dataset_volume,
+        f"/{VOLUME_NAME_MODEL}": trained_model_volume,
+        f"/{VOLUME_NAME_DATASET}": dataset_volume,
     },
     timeout=N_HOURS * HOURS,
     secrets=[
@@ -70,5 +72,5 @@ def main(config: str):
     # load yaml config
     config_name = os.path.basename(config)
     with open(config, "r") as f:
-        _config = yaml.safe_load(f)
-    run_train.remote(config_name=config_name, config=_config, n_gpus=N_GPUS)
+        config = yaml.safe_load(f)
+    run_train.remote(config_name=config_name, config=config, n_gpus=N_GPUS)

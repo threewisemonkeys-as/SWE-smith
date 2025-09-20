@@ -32,8 +32,7 @@ def get_original_ps_from_pr(instance, log_dir_bug_gen=LOG_DIR_BUG_GEN):
     )
     if not metadata_path.exists():
         return ""
-    with open(metadata_path, "r") as f:
-        metadata = json.load(f)
+    metadata = json.load(open(metadata_path, "r"))
     if INSTANCE_REF not in metadata:
         return ""
     ps = metadata[INSTANCE_REF]["problem_statement"]
@@ -44,8 +43,7 @@ def main(dataset_path: str):
     dataset_path = Path(dataset_path)
 
     # Load bug dataset
-    with open(dataset_path, "r") as f:
-        dataset = json.load(f)
+    dataset = json.load(open(dataset_path, "r"))
     print(f"Found {len(dataset)} task instances to generate instructions for")
     kept = []
     for instance in tqdm(dataset):

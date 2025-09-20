@@ -1,7 +1,8 @@
 """
 Purpose: Given a pull request, mirror the bug in the current form of the repository.
 
-Usage: python -m swesmith.bug_gen.mirror.generate logs/prs/data/*-task-instances.jsonl
+Usage: python -m swesmith.bug_gen.mirror.main \
+    /path/to/swe-bench-task-instances.json
 """
 
 import argparse
@@ -11,14 +12,14 @@ import logging
 import os
 import re
 import shutil
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import current_process
 import uuid
 import traceback
 import signal
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from dotenv import load_dotenv
 from litellm import completion, completion_cost
-from multiprocessing import current_process
 from swebench.harness.constants import KEY_INSTANCE_ID
 from swesmith.bug_gen.utils import (
     apply_patches,
@@ -32,11 +33,11 @@ from swesmith.bug_gen.mirror.prompts import (
 from swesmith.constants import (
     LOG_DIR_BUG_GEN,
     KEY_PATCH,
+    MAP_REPO_TO_SPECS,
     PREFIX_BUG,
     PREFIX_METADATA,
-    INSTANCE_REF,
 )
-from swesmith.profiles import global_registry, RepoProfile
+from swesmith.utils import clone_repo, get_repo_name
 from tqdm.auto import tqdm
 from unidiff import PatchSet
 
@@ -49,6 +50,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 litellm.suppress_debug_info = True
 
+INSTANCE_REF = "instance_ref"
 MIRROR_PR = "pr_mirror"
 KEY_COST = "cost"
 KEY_PULL_NUM = "pull_number"
@@ -258,7 +260,7 @@ def process_single_instance(inst, repo, model, api_key=None):
         os.makedirs(log_path, exist_ok=True)
 
         os.chdir(temp_dir)
-        global_registry.get(repo).clone()
+        clone_repo(repo)
 
         # Check if we should attempt recovery
         attempt_recovery, reason = should_attempt_recovery(inst, repo)
@@ -337,22 +339,6 @@ def init_worker():
     os.makedirs(worker_tempdirs[this_worker_id], exist_ok=True)
 
 
-def sweb_inst_to_rp(inst: dict) -> RepoProfile:
-    owner, repo = inst["repo"].split("/")
-    rps = [x for x in global_registry.values() if x.owner == owner and x.repo == repo]
-    if len(rps) == 0:
-        raise ValueError(
-            f"{repo} not found in SWE-smith registry, create profile for repo under swesmith/profiles"
-        )
-    elif len(rps) > 1:
-        print(f"Multiple profiles for {owner}/{repo} found")
-        for i, rp in enumerate(rps):
-            print(f"{i + 1}. {rp.commit}")
-        idx = int(input("Enter index of RepoProfile to use: "))
-        return rps[idx]
-    return rps[0]
-
-
 def main(
     sweb_insts_files: list,
     model: str,
@@ -371,7 +357,7 @@ def main(
     seen_repo_inst_ids = set()
 
     for sweb_insts_file in sweb_insts_files:
-        if any([sweb_insts_file.endswith(ext) for ext in [".jsonl", ".jsonl.all"]]):
+        if sweb_insts_file.endswith(".jsonl"):
             file_instances = [json.loads(line) for line in open(sweb_insts_file)]
         elif sweb_insts_file.endswith(".json"):
             file_instances = json.load(open(sweb_insts_file))
@@ -380,11 +366,19 @@ def main(
                 f"Invalid file format for {sweb_insts_file}. Must be .json or .jsonl"
             )
         for inst in file_instances:
-            inst[MIRROR_PR] = sweb_inst_to_rp(inst).repo_name
-            repo_inst_id = (inst[MIRROR_PR], inst[KEY_INSTANCE_ID])
-            if repo_inst_id in seen_repo_inst_ids:
+            repo = inst["repo"]
+            if repo in MAP_REPO_TO_SPECS:
+                commit = list(MAP_REPO_TO_SPECS[repo].keys())[
+                    0
+                ]  # TODO: This mapping is a bit hardcoded to SWE-smith.
+                repo = get_repo_name(repo, commit)
+            else:
+                raise ValueError(
+                    f"Invalid repo: {repo} - must be in {MAP_REPO_TO_SPECS.keys()}"
+                )
+            if (repo, inst[KEY_INSTANCE_ID]) in seen_repo_inst_ids:
                 raise ValueError(f"Duplicate instance ID: {inst[KEY_INSTANCE_ID]}")
-            seen_repo_inst_ids.add(repo_inst_id)
+            seen_repo_inst_ids.add((repo, inst[KEY_INSTANCE_ID]))
             all_instances.append(inst)
     print(f"Found {len(all_instances)} instances across {len(sweb_insts_files)} files")
 
@@ -393,16 +387,20 @@ def main(
     all_repos = set()
     repos_to_process = set()
     for inst in all_instances:
+        repo = inst["repo"]
+        if repo in MAP_REPO_TO_SPECS:
+            commit = list(MAP_REPO_TO_SPECS[repo].keys())[0]
+            repo = get_repo_name(repo, commit)
         should_process, status = should_process_instance(
-            inst, inst[MIRROR_PR], redo_existing, redo_skipped
+            inst, repo, redo_existing, redo_skipped
         )
         if should_process:
             to_process.append(inst)
         elif status:
             already_completed[status].append(inst)
-        all_repos.add(inst[MIRROR_PR])
+        all_repos.add(repo)
         if should_process:
-            repos_to_process.add(inst[MIRROR_PR])
+            repos_to_process.add(repo)
     print("Pre-processing report:")
     print(f"- Repos to process: {len(repos_to_process)}")
     print(f"- Instances to process: {len(to_process)}")
@@ -422,7 +420,11 @@ def main(
 
     task_args = []
     for inst in to_process:
-        task_args.append((inst, inst[MIRROR_PR], model, api_key))
+        repo = inst["repo"]
+        if repo in MAP_REPO_TO_SPECS:
+            commit = list(MAP_REPO_TO_SPECS[repo].keys())[0]
+            repo = get_repo_name(repo, commit)
+        task_args.append((inst, repo, model, api_key))
 
     pbar = tqdm(total=len(task_args))
 

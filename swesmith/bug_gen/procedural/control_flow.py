@@ -1,19 +1,20 @@
 import libcst
 
-from swesmith.bug_gen.procedural import PythonProceduralModifier
-from swesmith.constants import CodeProperty
+from functools import partial
+from swesmith.bug_gen.procedural import BaseProceduralModifier
+from swesmith.bug_gen.criteria import *
 
 
-class ControlIfElseInvertModifier(PythonProceduralModifier):
+class ControlIfElseInvertModifier(BaseProceduralModifier):
     explanation: str = (
         "The if-else conditions may be out of order, or the bodies are inverted."
     )
     name: str = "func_pm_ctrl_invert_if"
     conditions: list = [
-        CodeProperty.IS_FUNCTION,
-        CodeProperty.HAS_IF_ELSE,
+        filter_functions,
+        filter_if_else,
+        partial(filter_min_simple_complexity, threshold=5),
     ]
-    min_complexity: int = 5
 
     def leave_If(self, original_node: libcst.If, updated_node: libcst.If) -> libcst.If:
         if not self.flip():
@@ -42,14 +43,14 @@ class ControlIfElseInvertModifier(PythonProceduralModifier):
         return updated_node
 
 
-class ControlShuffleLinesModifier(PythonProceduralModifier):
+class ControlShuffleLinesModifier(BaseProceduralModifier):
     explanation: str = "The lines inside a function may be out of order."
     name: str = "func_pm_ctrl_shuffle"
     conditions: list = [
-        CodeProperty.IS_FUNCTION,
-        CodeProperty.HAS_LOOP,
+        filter_functions,
+        partial(filter_min_simple_complexity, threshold=3),
+        partial(filter_max_simple_complexity, threshold=10),
     ]
-    max_complexity: int = 10
 
     def leave_FunctionDef(
         self, original_node: libcst.FunctionDef, updated_node: libcst.FunctionDef

@@ -72,9 +72,7 @@ if __name__ == "__main__":
         for k, v in Counter(distribution).items():
             print(f"* {k}: {v} ({round(v * 100 / len(distribution), 2)}%)")
 
-    with open("difficulty_train.jsonl") as f:
-        check = [json.loads(x) for x in f.readlines()]
+    check = [json.loads(x) for x in open("difficulty_train.jsonl").readlines()]
     print(len(check))
-    with open("difficulty_test.jsonl") as f:
-        check = [json.loads(x) for x in f.readlines()]
+    check = [json.loads(x) for x in open("difficulty_test.jsonl").readlines()]
     print(len(check))

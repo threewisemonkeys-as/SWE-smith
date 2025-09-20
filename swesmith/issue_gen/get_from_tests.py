@@ -31,14 +31,18 @@ from swebench.harness.docker_utils import (
     exec_run_with_timeout,
 )
 from swesmith.constants import (
+    ENV_NAME,
     KEY_IMAGE_NAME,
+    KEY_TEST_CMD,
     LOG_DIR_ISSUE_GEN,
+    MAP_REPO_TO_SPECS,
     TEST_OUTPUT_END,
     TEST_OUTPUT_START,
+    TEST_PYTEST,
+    TIMEOUT,
 )
 from swesmith.issue_gen.utils import get_test_function
-from swesmith.profiles import RepoProfile, global_registry
-from swesmith.profiles.python import PythonProfile
+from swesmith.utils import get_repo_commit_from_image_name
 from tqdm.auto import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
@@ -61,15 +65,15 @@ TEST_INFO = """**Test Source Code**
 """
 
 
-def get_verbose_test_cmd(instance: dict, rp: RepoProfile, test_idx: int | None = None):
+def get_verbose_test_cmd(instance: dict, test_idx: int | None = None):
     """
     Get test command that runs a random F2P test verbosely.
     """
-    test_cmd = rp.test_cmd
-    # TODO: This should probably be changed, or incorporated into the profile
-    if test_cmd == PythonProfile.test_cmd:
+    repo, commit = get_repo_commit_from_image_name(instance[KEY_IMAGE_NAME])
+    test_cmd = MAP_REPO_TO_SPECS[repo][commit][KEY_TEST_CMD]
+    if TEST_PYTEST in test_cmd:
         test_cmd = test_cmd.replace(
-            PythonProfile.test_cmd, "pytest -v --showlocals --tb=long --color=no"
+            TEST_PYTEST, "pytest -v --showlocals --tb=long --color=no"
         )
     f2p_test = (
         random.choice(instance[FAIL_TO_PASS])
@@ -80,7 +84,7 @@ def get_verbose_test_cmd(instance: dict, rp: RepoProfile, test_idx: int | None =
     return test_cmd
 
 
-def run_command_in_container(instance: dict, command: str, rp: RepoProfile):
+def run_command_in_container(instance: dict, command: str):
     """
     Run a command in a docker container.
     """
@@ -109,6 +113,8 @@ def run_command_in_container(instance: dict, command: str, rp: RepoProfile):
             [
                 "#!/bin/bash",
                 "set -uxo pipefail",
+                "source /opt/miniconda3/bin/activate",
+                f"conda activate {ENV_NAME}",
                 f"cd {DOCKER_WORKDIR}",
                 "git fetch",
                 f"git checkout {instance[KEY_INSTANCE_ID]}",
@@ -124,12 +130,12 @@ def run_command_in_container(instance: dict, command: str, rp: RepoProfile):
     # Checkout the commit corresponding to the bug + run testing command
     container.exec_run("git fetch", workdir=DOCKER_WORKDIR, user=DOCKER_USER)
     container.exec_run(
-        f"git checkout {instance['instance_id']}",
+        f"git checkout {instance['base_commit']}",
         workdir=DOCKER_WORKDIR,
         user=DOCKER_USER,
     )
     test_output, _, _ = exec_run_with_timeout(
-        container, "/bin/bash /eval.sh", timeout=rp.timeout
+        container, "/bin/bash /eval.sh", timeout=TIMEOUT
     )
     start_idx = test_output.find(TEST_OUTPUT_START) + len(TEST_OUTPUT_START)
     end_idx = test_output.find(TEST_OUTPUT_END)
@@ -155,8 +161,7 @@ def _process_instance(instance: dict, config_file: str | None, model: str | None
 
     cloned = False
     if log_dir.exists() and path_metadata.exists() and path_issue.exists():
-        with open(path_metadata, "r") as f:
-            metadata = json.load(f)
+        metadata = json.load(open(path_metadata, "r"))
         test_idx = metadata["test_idx"]
         test_info = metadata["test_info"]
         test_output = metadata["test_output"]
@@ -171,8 +176,7 @@ def _process_instance(instance: dict, config_file: str | None, model: str | None
             return {"completed": 1, "timed_out": 0, "failed": 0}
     else:
         test_idx = random.randint(0, len(instance[FAIL_TO_PASS]) - 1)
-        rp = global_registry.get_from_inst(instance)
-        cmd = get_verbose_test_cmd(instance, rp, test_idx)
+        cmd = get_verbose_test_cmd(instance, test_idx)
         test_output = run_command_in_container(instance, cmd)
         test_func = get_test_function(instance, test_idx)
         test_src = test_func["test_src"]
@@ -181,8 +185,7 @@ def _process_instance(instance: dict, config_file: str | None, model: str | None
 
     generated = None
     if config_file and model:
-        with open(config_file, "r") as f:
-            config = yaml.safe_load(f)
+        config = yaml.safe_load(open(config_file, "r"))
         messages = [
             {"content": config["system"], "role": "system"},
             {
@@ -229,8 +232,7 @@ def main(dataset_path: str, config_file: str | None, model: str | None, n_worker
             "Config file must be provided if model is provided."
         )
 
-    with open(dataset_path, "r") as f:
-        dataset = json.load(f)
+    dataset = json.load(open(dataset_path, "r"))
     print(f"Found {len(dataset)} task instances to generate instructions for")
     random.seed(24)
 

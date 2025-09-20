@@ -18,10 +18,9 @@ from swesmith.constants import (
     LOG_DIR_TASKS,
     PREFIX_BUG,
     PREFIX_METADATA,
-    generate_hash,
 )
 from swesmith.bug_gen.utils import apply_patches, get_combos
-from swesmith.profiles import global_registry
+from swesmith.utils import clone_repo, generate_hash
 from tqdm.auto import tqdm
 from unidiff import PatchSet
 
@@ -37,10 +36,8 @@ def convert_to_path(folder: str):
     return path
 
 
-def get_patches_from_folder(folder_path, include_patches=None):
+def get_patches_from_folder(folder_path, include_patches=[]):
     """Get all patch file paths from a folder."""
-    if include_patches is None:
-        include_patches = []
     patch_files = []
     for root, _, files in os.walk(folder_path):
         for file in files:
@@ -181,7 +178,7 @@ def main(
     )
 
     # For each module
-    global_registry.get(repo).clone()
+    clone_repo(repo)
     total_success, total_fails = 0, 0
     for path, patches in tqdm(map_path_to_patches.items()):
         combos = get_combos(patches, num_patches, max_combos)

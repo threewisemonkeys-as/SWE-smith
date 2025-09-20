@@ -1,44 +1,16 @@
 import libcst
 
-from swesmith.bug_gen.procedural import PythonProceduralModifier
-from swesmith.constants import CodeProperty
+from swesmith.bug_gen.procedural import FLIPPED_OPERATORS, BaseProceduralModifier
+from swesmith.bug_gen.criteria import *
 
 
-FLIPPED_OPERATORS = {
-    libcst.Add: libcst.Subtract,
-    libcst.And: libcst.Or,
-    libcst.BitAnd: libcst.BitOr,
-    libcst.BitAnd: libcst.BitXor,
-    libcst.BitOr: libcst.BitAnd,
-    libcst.BitXor: libcst.BitAnd,
-    libcst.Divide: libcst.Multiply,
-    libcst.Equal: libcst.NotEqual,
-    libcst.FloorDivide: libcst.Modulo,
-    libcst.GreaterThan: libcst.LessThan,
-    libcst.GreaterThanEqual: libcst.LessThanEqual,
-    libcst.In: libcst.NotIn,
-    libcst.Is: libcst.IsNot,
-    libcst.IsNot: libcst.Is,
-    libcst.LeftShift: libcst.RightShift,
-    libcst.LessThan: libcst.GreaterThan,
-    libcst.LessThanEqual: libcst.GreaterThanEqual,
-    libcst.Modulo: libcst.FloorDivide,
-    libcst.Multiply: libcst.Divide,
-    libcst.NotEqual: libcst.Equal,
-    libcst.NotIn: libcst.In,
-    libcst.Or: libcst.And,
-    libcst.Power: libcst.Multiply,
-    libcst.RightShift: libcst.LeftShift,
-    libcst.Subtract: libcst.Add,
-}
-
-
-class OperationChangeModifier(PythonProceduralModifier):
+class OperationChangeModifier(BaseProceduralModifier):
     explanation: str = "The operations in an expressions are likely incorrect."
     name: str = "func_pm_op_change"
     conditions: list = [
-        CodeProperty.IS_FUNCTION,
-        CodeProperty.HAS_BINARY_OP,
+        filter_functions,
+        filter_operations_binary,
+        filter_min_simple_complexity,
     ]
 
     def leave_BinaryOperation(self, original_node, updated_node):
@@ -82,12 +54,13 @@ class OperationChangeModifier(PythonProceduralModifier):
         return updated_node
 
 
-class OperationFlipOperatorModifier(PythonProceduralModifier):
+class OperationFlipOperatorModifier(BaseProceduralModifier):
     explanation: str = "The operators in an expression are likely incorrect."
     name: str = "func_pm_flip_operators"
     conditions: list = [
-        CodeProperty.IS_FUNCTION,
-        CodeProperty.HAS_BINARY_OP,
+        filter_functions,
+        lambda node: filter_operations_binary(node) or filter_operations_bool(node),
+        partial(filter_min_simple_complexity, threshold=3),
     ]
 
     def _flip_operator(self, updated_node):
@@ -108,12 +81,13 @@ class OperationFlipOperatorModifier(PythonProceduralModifier):
         return self._flip_operator(updated_node) if self.flip() else updated_node
 
 
-class OperationSwapOperandsModifier(PythonProceduralModifier):
+class OperationSwapOperandsModifier(BaseProceduralModifier):
     explanation: str = "The operands in an expression are likely in the wrong order."
     name: str = "func_pm_op_swap"
     conditions: list = [
-        CodeProperty.IS_FUNCTION,
-        CodeProperty.HAS_BINARY_OP,
+        filter_functions,
+        lambda node: filter_operations_binary(node) or filter_operations_bool(node),
+        filter_min_simple_complexity,
     ]
 
     def leave_BinaryOperation(self, original_node, updated_node):
@@ -131,14 +105,15 @@ class OperationSwapOperandsModifier(PythonProceduralModifier):
         return updated_node
 
 
-class OperationBreakChainsModifier(PythonProceduralModifier):
+class OperationBreakChainsModifier(BaseProceduralModifier):
     explanation: str = (
         "There are expressions or mathemtical operations that are likely incomplete."
     )
     name: str = "func_pm_op_break_chains"
     conditions: list = [
-        CodeProperty.IS_FUNCTION,
-        CodeProperty.HAS_BINARY_OP,
+        filter_functions,
+        filter_operations_binary,
+        filter_min_simple_complexity,
     ]
 
     def leave_BinaryOperation(self, original_node, updated_node):
@@ -150,12 +125,13 @@ class OperationBreakChainsModifier(PythonProceduralModifier):
         return updated_node
 
 
-class OperationChangeConstantsModifier(PythonProceduralModifier):
+class OperationChangeConstantsModifier(BaseProceduralModifier):
     explanation: str = "The constants in an expression might be incorrect."
     name: str = "func_pm_op_change_const"
     conditions: list = [
-        CodeProperty.IS_FUNCTION,
-        CodeProperty.HAS_BINARY_OP,
+        filter_functions,
+        filter_operations_binary,
+        filter_min_simple_complexity,
     ]
 
     def leave_BinaryOperation(self, original_node, updated_node):

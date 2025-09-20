@@ -3,15 +3,17 @@ Purpose: Given a repository, blank out various functions/classes, then ask the m
 
 Usage: python -m swesmith.bug_gen.llm.rewrite \
     --model <model> \
+    --type <entity_type> \
     repo  # e.g., tkrajina__gpxpy.09fc46b3
 
 Where model follows the litellm format.
 
 Example:
 
-python -m swesmith.bug_gen.llm.rewrite tkrajina__gpxpy.09fc46b3 --model claude-3-7-sonnet-20250219
+python -m swesmith.bug_gen.llm.rewrite tkrajina__gpxpy.09fc46b3 --model claude-3-7-sonnet-20250219 --type class
 """
 
+import ast
 import argparse
 import json
 import litellm
@@ -25,23 +27,22 @@ import yaml
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from litellm import completion
 from litellm.cost_calculator import completion_cost
+from swesmith.bug_gen.criteria import filter_min_simple_complexity
 from swesmith.bug_gen.llm.utils import (
     PROMPT_KEYS,
     extract_code_block,
+    strip_function_body,
 )
 from swesmith.bug_gen.utils import (
-    apply_code_change,
-    get_bug_directory,
-    get_patch,
-)
-from swesmith.constants import (
-    LOG_DIR_BUG_GEN,
-    PREFIX_BUG,
-    PREFIX_METADATA,
+    ENTITY_TYPES,
     BugRewrite,
     CodeEntity,
+    apply_code_change,
+    extract_entities_from_directory,
+    get_patch,
 )
-from swesmith.profiles import global_registry
+from swesmith.constants import LOG_DIR_BUG_GEN, PREFIX_BUG, PREFIX_METADATA
+from swesmith.utils import clone_repo
 from tqdm.auto import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 from typing import Any
@@ -54,21 +55,32 @@ litellm.suppress_debug_info = True
 random.seed(24)
 
 
+def get_function_signature(node):
+    """Generate the function signature as a string."""
+    args = [ast.unparse(arg) for arg in node.args.args]  # For Python 3.9+
+    args_str = ", ".join(args)
+    return f"def {node.name}({args_str})"
+
+
 def main(
     repo: str,
     config_file: str,
     model: str,
+    entity_type: str,
     n_workers: int,
     redo_existing: bool = False,
-    max_bugs: int | None = None,
+    max_bugs: int = None,
     **kwargs,
 ):
     configs = yaml.safe_load(open(config_file))
-    rp = global_registry.get(repo)
-    rp.clone()
-
+    print(f"Cloning {repo}...")
+    clone_repo(repo)
     print(f"Extracting entities from {repo}...")
-    candidates = rp.extract_entities()
+    candidates = [
+        x
+        for x in extract_entities_from_directory(repo, entity_type)
+        if filter_min_simple_complexity(x, 3)
+    ]
     if max_bugs:
         random.shuffle(candidates)
         candidates = candidates[:max_bugs]
@@ -81,7 +93,9 @@ def main(
         print("Skipping existing bugs.")
 
     def _process_candidate(candidate: CodeEntity) -> dict[str, Any]:
-        bug_dir = get_bug_directory(log_dir, candidate)
+        bug_dir = (
+            log_dir / candidate.file_path.replace("/", "__") / candidate.src_node.name
+        )
         if not redo_existing:
             if bug_dir.exists() and any(
                 [
@@ -94,7 +108,7 @@ def main(
         try:
             # Blank out the function body
             blank_function = BugRewrite(
-                rewrite=candidate.stub,
+                rewrite=strip_function_body(candidate.src_code),
                 explanation="Blanked out the function body.",
                 strategy=LM_REWRITE,
             )
@@ -104,7 +118,7 @@ def main(
 
         # Get prompt content
         prompt_content = {
-            "func_signature": candidate.signature,
+            "func_signature": get_function_signature(candidate.src_node),
             "func_to_write": blank_function.rewrite,
             "file_src_code": open(candidate.file_path).read(),
         }
@@ -119,12 +133,7 @@ def main(
             if k in configs
         ]
         messages = [x for x in messages if x["content"]]
-        try:
-            response: Any = completion(
-                model=model, messages=messages, n=1, temperature=0
-            )
-        except litellm.ContextWindowExceededError:
-            return {"n_generation_failed": 1, "cost": 0.0}
+        response: Any = completion(model=model, messages=messages, n=1, temperature=0)
         choice = response.choices[0]
         message = choice.message
 
@@ -149,8 +158,6 @@ def main(
         )
         apply_code_change(candidate, rewrite)
         patch = get_patch(repo, reset_changes=True)
-        if not patch or len(patch.strip()) == 0:
-            return {"n_generation_failed": 0, "cost": cost}
 
         # Log the bug
         bug_dir.mkdir(parents=True, exist_ok=True)
@@ -192,21 +199,24 @@ if __name__ == "__main__":
         "repo", type=str, help="Repository to generate bug patches for."
     )
     parser.add_argument(
-        "-c",
-        "--config_file",
-        type=str,
-        help="Path to the configuration file.",
-        required=True,
+        "--config_file", type=str, help="Path to the configuration file.", required=True
     )
     parser.add_argument("--model", type=str, help="Model to use for rewriting.")
     parser.add_argument(
-        "-w", "--n_workers", type=int, help="Number of workers to use", default=1
+        "--type",
+        dest="entity_type",
+        type=str,
+        choices=list(ENTITY_TYPES.keys()),
+        help="Type of entity to generate bug patches for.",
+    )
+    parser.add_argument(
+        "--n_workers", type=int, help="Number of workers to use", default=1
     )
     parser.add_argument(
         "--redo_existing", action="store_true", help="Redo existing bugs."
     )
     parser.add_argument(
-        "-m", "--max_bugs", type=int, help="Maximum number of bugs to generate."
+        "--max_bugs", type=int, help="Maximum number of bugs to generate."
     )
     args = parser.parse_args()
     main(**vars(args))

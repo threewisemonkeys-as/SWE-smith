@@ -66,7 +66,7 @@ Excited about SWE-smith? We're actively working on several follow ups, and love 
 
 Check out the [Contributing Guide](CONTRIBUTING.md) for more.
 
-Contact Person: [John Yang](https://john-b-yang.github.io/), [Kilian Lieret](https://lieret.net)
+Contact Person: [John Yang](https://john-b-yang.github.io/), [Kilian Lieret](https://github.com/klieret/)
 (Email: [johnby@stanford.edu](mailto:johnby@stanford.edu))
 
 ## 🪪 License
@@ -86,7 +86,7 @@ MIT. Check `LICENSE` for more information.
 }
 ```
 
-## 📕 Our Other Projects:
+## 📕 Related Works
 <div align="center">
   <a href="https://github.com/SWE-bench/SWE-bench"><img src="docs/assets/swebench_logo_text_below.svg" alt="SWE-bench" height="120px"></a>
   &nbsp;&nbsp;

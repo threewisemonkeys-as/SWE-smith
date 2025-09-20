@@ -3,7 +3,8 @@ Purpose: Given a repository, procedurally generate a variety of bugs for functio
 
 Usage: python -m swesmith.bug_gen.procedural.generate \
     --repo <repo> \
-    --commit <commit>
+    --commit <commit> \
+    --type <entity_type>
 """
 
 import argparse
@@ -15,21 +16,23 @@ import shutil
 from pathlib import Path
 from rich import print
 from swesmith.bug_gen.utils import (
+    ENTITY_TYPES,
+    BugRewrite,
+    CodeEntity,
     apply_code_change,
-    get_bug_directory,
+    extract_entities_from_directory,
     get_patch,
 )
 from swesmith.constants import (
     LOG_DIR_BUG_GEN,
+    ORG_NAME,
     PREFIX_BUG,
     PREFIX_METADATA,
-    BugRewrite,
-    CodeEntity,
 )
-from swesmith.profiles import global_registry
+from swesmith.utils import clone_repo, does_repo_exist
 from tqdm.auto import tqdm
 
-from swesmith.bug_gen.procedural import PythonProceduralModifier
+from swesmith.bug_gen.procedural import BaseProceduralModifier
 from swesmith.bug_gen.procedural.classes import (
     ClassRemoveBasesModifier,
     ClassRemoveFuncsModifier,
@@ -52,10 +55,13 @@ from swesmith.bug_gen.procedural.remove import (
     RemoveWrapperModifier,
 )
 
-PM_TECHNIQUES = [
+PM_TECHNIQUES_CLASSES = [
     ClassRemoveBasesModifier(likelihood=0.25),
     ClassRemoveFuncsModifier(likelihood=0.15),
     ClassShuffleMethodsModifier(likelihood=0.25),
+]
+
+PM_TECHNIQUES_FUNCS = [
     ControlIfElseInvertModifier(likelihood=0.25),
     ControlShuffleLinesModifier(likelihood=0.25),
     RemoveAssignModifier(likelihood=0.25),
@@ -70,7 +76,7 @@ PM_TECHNIQUES = [
 
 
 def _process_candidate(
-    candidate: CodeEntity, pm: PythonProceduralModifier, log_dir: Path, repo: str
+    candidate: CodeEntity, pm: BaseProceduralModifier, log_dir: Path, repo: str
 ):
     """
     Process a candidate by applying a given procedural modification to it.
@@ -104,7 +110,7 @@ def _process_candidate(
     )
 
     # Create artifacts
-    bug_dir = get_bug_directory(log_dir, candidate)
+    bug_dir = log_dir / candidate.file_path.replace("/", "__") / candidate.src_node.name
     bug_dir.mkdir(parents=True, exist_ok=True)
     uuid_str = f"{pm.name}__{bug.get_hash()}"
     metadata_path = f"{PREFIX_METADATA}__{uuid_str}.json"
@@ -123,22 +129,32 @@ def _process_candidate(
 
 def main(
     repo: str,
+    entity_type: str,
     max_bugs: int,
     seed: int,
 ):
+    assert does_repo_exist(repo), f"Repository {repo} does not exist in {ORG_NAME}."
     random.seed(seed)
+
     total = 0
-    rp = global_registry.get(repo)
-    rp.clone()
-    entities = rp.extract_entities()
-    print(f"Found {len(entities)} entities in {repo}.")
+    PM_TECHNIQUES = {
+        "class": PM_TECHNIQUES_CLASSES,
+        "func": PM_TECHNIQUES_FUNCS,
+        "object": PM_TECHNIQUES_CLASSES + PM_TECHNIQUES_FUNCS,
+    }[entity_type]
+    clone_repo(repo)
+    print(f"Cloned {repo} repository.")
+    entities = extract_entities_from_directory(repo, entity_type)
+    print(f"Found {len(entities)} {entity_type} entities in {repo}.")
     for pm in PM_TECHNIQUES:
-        print(f"Generating [bold blue]{pm.name}[/bold blue] bugs in {repo}...")
-        candidates = [x for x in entities if pm.can_change(x)]
+        print(
+            f"Generating [bold blue]{pm.name}[/bold blue] bugs for [bold blue]{entity_type}[/bold blue] in {repo}..."
+        )
+        candidates = [x for x in entities if all(c(x) for c in pm.conditions)]
         if not candidates:
-            print(f"No candidates found in {repo}.")
+            print(f"No candidates found for {entity_type} in {repo}.")
             continue
-        print(f"Found {len(candidates)} candidates in {repo}.")
+        print(f"Found {len(candidates)} candidates for {entity_type} in {repo}.")
 
         log_dir = LOG_DIR_BUG_GEN / repo
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -162,6 +178,14 @@ if __name__ == "__main__":
         "repo",
         type=str,
         help="Name of a SWE-smith repository to generate bugs for.",
+    )
+    parser.add_argument(
+        "--type",
+        dest="entity_type",
+        type=str,
+        choices=list(ENTITY_TYPES.keys()),
+        default="func",
+        help="Type of entity to generate bugs for.",
     )
     parser.add_argument(
         "--seed",
