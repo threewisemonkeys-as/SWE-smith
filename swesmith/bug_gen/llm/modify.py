@@ -5,7 +5,6 @@ Usage: python -m swesmith.bug_gen.llm.modify \
     --n_bugs <n_bugs> \
     --config_file <config_file> \
     --model <model> \
-    --type <entity_type>
     repo  # e.g., tkrajina__gpxpy.09fc46b3
 
 Where model follows the litellm format.
@@ -16,6 +15,7 @@ python -m swesmith.bug_gen.llm.modify tkrajina__gpxpy.09fc46b3 --config_file con
 """
 
 import argparse
+import dataclasses
 import shutil
 import jinja2
 import json
@@ -26,27 +26,23 @@ import random
 import yaml
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
 from dotenv import load_dotenv
 from litellm import completion
 from litellm.cost_calculator import completion_cost
-from swesmith.bug_gen.criteria import MAP_KEY_TO_CRITERIA
 from swesmith.bug_gen.llm.utils import PROMPT_KEYS, extract_code_block
 from swesmith.bug_gen.utils import (
-    ENTITY_TYPES,
-    BugRewrite,
-    CodeEntity,
     apply_code_change,
-    extract_entities_from_directory,
+    get_bug_directory,
     get_patch,
 )
 from swesmith.constants import (
     LOG_DIR_BUG_GEN,
-    ORG_NAME,
     PREFIX_BUG,
     PREFIX_METADATA,
+    BugRewrite,
+    CodeEntity,
 )
-from swesmith.utils import clone_repo, does_repo_exist
+from swesmith.profiles import global_registry
 from tqdm.auto import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 from typing import Any
@@ -77,7 +73,12 @@ def gen_bug_from_code_lm(
 
         env.filters["shuffle"] = jinja_shuffle
         template = env.from_string(prompt)
-        return template.render(**asdict(candidate), **config.get("parameters", {}))
+
+        candidate_dict = {
+            field.name: getattr(candidate, field.name)
+            for field in dataclasses.fields(candidate)
+        }
+        return template.render(**candidate_dict, **config.get("parameters", {}))
 
     def get_role(key: str) -> str:
         if key == "system":
@@ -113,39 +114,43 @@ def gen_bug_from_code_lm(
 
 def main(
     config_file: str,
-    entity_type: str,
     model: str,
     n_bugs: int,
     repo: str,
-    *,
     n_workers: int = 1,
-    **kwargs,
+    max_bugs: int = -1,
 ):
     # Check arguments
-    assert does_repo_exist(repo), f"Repository {repo} does not exist in {ORG_NAME}."
     assert os.path.exists(config_file), f"{config_file} not found"
     assert n_bugs > 0, "n_bugs must be greater than 0"
     configs = yaml.safe_load(open(config_file))
-    assert all(key in configs for key in PROMPT_KEYS + ["criteria", "name"]), (
+    assert all(key in configs for key in PROMPT_KEYS + ["name"]), (
         f"Missing keys in {config_file}"
     )
 
     # Clone repository, identify valid candidates
     print("Cloning repository...")
-    clone_repo(repo)
+    rp = global_registry.get(repo)
+    rp.clone()
     print("Extracting candidates...")
-    candidates = extract_entities_from_directory(repo, entity_type)
-    print(f"{len(candidates)} candidates found for {entity_type} in {repo}")
-    candidates = [x for x in candidates if MAP_KEY_TO_CRITERIA[configs["criteria"]](x)]
-    print(f"{len(candidates)} candidates passed criteria")
+    candidates = rp.extract_entities()
+    print(f"{len(candidates)} candidates found in {repo}")
     if not candidates:
-        print(f"No candidates found for {entity_type} in {repo}.")
+        print(f"No candidates found in {repo}.")
         return
 
-    print(f"Generating bugs for {entity_type} in {repo} using {model}...")
-    if not kwargs.get("yes", False):
-        if input("Proceed with bug generation? (y/n): ").lower() != "y":
-            return
+    # Adjust candidates if max_bugs is specified
+    if max_bugs > 0:
+        max_candidates = max_bugs // n_bugs
+        if max_candidates < len(candidates):
+            candidates = candidates[:max_candidates]
+            print(
+                f"Limited to {len(candidates)} candidates to generate ~{len(candidates) * n_bugs} bugs (max: {max_bugs})"
+            )
+        else:
+            print(f"Will generate {len(candidates) * n_bugs} bugs (max: {max_bugs})")
+
+    print(f"Generating bugs in {repo} using {model}...")
 
     # Set up logging
     log_dir = LOG_DIR_BUG_GEN / repo
@@ -159,11 +164,7 @@ def main(
 
         for bug in bugs:
             # Create artifacts
-            bug_dir = (
-                log_dir
-                / candidate.file_path.replace("/", "__")
-                / candidate.src_node.name
-            )
+            bug_dir = get_bug_directory(log_dir, candidate)
             bug_dir.mkdir(parents=True, exist_ok=True)
             uuid_str = f"{configs['name']}__{bug.get_hash()}"
             metadata_path = f"{PREFIX_METADATA}__{uuid_str}.json"
@@ -180,7 +181,7 @@ def main(
                     f.write(patch)
             except Exception as e:
                 print(
-                    f"Error applying bug to {candidate.src_node.name} in {candidate.file_path}: {e}",
+                    f"Error applying bug to {candidate.name} in {candidate.file_path}: {e}",
                 )
                 # import traceback
                 # print(f"Traceback:\n{''.join(traceback.format_exc())}")
@@ -221,12 +222,11 @@ if __name__ == "__main__":
         help="Name of a SWE-smith repository to generate bugs for.",
     )
     parser.add_argument(
-        "--type",
-        dest="entity_type",
+        "-c",
+        "--config_file",
         type=str,
-        choices=list(ENTITY_TYPES.keys()),
-        default="func",
-        help="Type of entity to generate bugs for.",
+        help="Configuration file containing bug gen. strategy prompts",
+        required=True,
     )
     parser.add_argument(
         "--model",
@@ -235,20 +235,21 @@ if __name__ == "__main__":
         default="openai/gpt-4o",
     )
     parser.add_argument(
+        "-n",
         "--n_bugs",
         type=int,
         help="Number of bugs to generate per entity",
         default=1,
     )
     parser.add_argument(
-        "--config_file",
-        type=str,
-        help="Configuration file containing bug gen. strategy prompts",
-        required=True,
+        "-m",
+        "--max_bugs",
+        type=int,
+        help="Total, maximum number of bugs to generate",
+        default=-1,
     )
-    parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
     parser.add_argument(
-        "--n_workers", type=int, help="Number of workers to use", default=1
+        "-w", "--n_workers", type=int, help="Number of workers to use", default=1
     )
     args = parser.parse_args()
     main(**vars(args))

@@ -48,8 +48,7 @@ To prompt an LM to modify a function to introduce a bug:
 python -m swesmith.bug_gen.llm.modify $repo \
   --n_bugs 1 \
   --model openai/gpt-4o \
-  --entity_type func \
-  --prompt_config configs/bug_gen/lm_modify.yml
+  --config_file configs/bug_gen/lm_modify.yml
 ```
 
 To prompt an LM to rewrite a function from scratch:

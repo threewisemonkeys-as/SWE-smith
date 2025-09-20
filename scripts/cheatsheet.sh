@@ -5,15 +5,12 @@
 ## The scripts are written such that you do *not* need to have the repository installed locally (run `pip install swesmith`).
 ## *Although*, some scripts require config files (you can download them from the repo).
 
-## NOTE: If you want to create repositories + task instances under your own account,
-## change swesmith/constants.py:29 (the `ORG_NAME` variable) to your own account.
-
 
 ###### MARK: Create Environment for Repository ######
 
 # Attempts to create a conda environment for the repo. If successfully, a
 # dump of the conda environment is saved to `logs/build_images/records``
-python -m swesmith.build_repo.try_install Instagram/MonkeyType configs/install_repo.sh --commit 70c3acf62950be5dfb28743c7a719bfdecebcd84
+python -m swesmith.build_repo.try_install_py Instagram/MonkeyType configs/install_repo.sh --commit 70c3acf62950be5dfb28743c7a719bfdecebcd84
 
 # Download all existing SWE-smith environments
 # (All images downloaded by default, but you can specify a specific repo
@@ -32,7 +29,6 @@ repo="Instagram__MonkeyType.70c3acf6"
 # LM Rewrite
 python -m swesmith.bug_gen.llm.rewrite $repo \
     --model anthropic/claude-3-7-sonnet-20250219 \
-    --type func \
     --config_file configs/bug_gen/lm_rewrite.yml \
     --n_workers 1
 
@@ -40,13 +36,10 @@ python -m swesmith.bug_gen.llm.rewrite $repo \
 python -m swesmith.bug_gen.llm.modify $repo \
     --n_bugs 1 \
     --model openai/gpt-4o \
-    --entity_type func \
     --prompt_config configs/bug_gen/lm_modify.yml
 
 # Procedural Modifications
-python -m swesmith.bug_gen.procedural.generate $repo \
-    --type func \
-    --max_bugs 10
+python -m swesmith.bug_gen.procedural.generate $repo --max_bugs 10
 
 # Combine (Same File) - Must have validated task instances to run this script
 python -m swesmith.bug_gen.combine.same_file logs/bug_gen/$repo \
@@ -62,10 +55,10 @@ python -m swesmith.bug_gen.combine.same_module logs/bug_gen/$repo \
     --depth 2
 
 # PR Mirroring
-## NOTE: `path/to/task_candidates.jsonl` is the output of running this
-## the SWE-bench task candidate collection script:
-## https://github.com/SWE-bench/SWE-bench/blob/main/swebench/collect/run_get_tasks_pipeline.sh
-python -m swesmith.bug_gen.mirror.generate path/to/task_candidates.jsonl --model openai/o3-mini
+# 1. Collect task instances
+python -m swesmith.bug_gen.mirror.collect --repos 'Instagram/MonkeyType' --path_prs logs/prs/dumps/ --path_tasks logs/prs/data/
+# 2. Run mirroring on the task candidates
+python -m swesmith.bug_gen.mirror.generate logs/prs/data/MonkeyType-insts.jsonl --model openai/o3-mini
 
 
 ###### MARK: Validate + Evaluate Task Instances ######
@@ -78,8 +71,7 @@ python -m swesmith.bug_gen.mirror.generate path/to/task_candidates.jsonl --model
 python -m swesmith.bug_gen.collect_patches logs/bug_gen/$repo
 
 # Run validation
-python -m swesmith.harness.valid logs/bug_gen/$repo_all_patches.json \
-    --run_id $repo
+python -m swesmith.harness.valid logs/bug_gen/$repo_all_patches.json
 
 # Collect task instances with 1+ F2P
 python -m swesmith.harness.gather logs/run_validation/$repo

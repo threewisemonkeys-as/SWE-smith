@@ -5,13 +5,14 @@ Usage: python -m swesmith.harness.eval \
     --dataset_path <path to dataset> \
     --predictions_path <gold / path to predictions> \
     --run_id <unique identifier for this run> \
-    --max_workers <number of workers to use>
+    --workers <number of workers to use>
 """
 
 import argparse
 import json
 import os
 
+from datasets import load_dataset
 from swebench.harness.constants import (
     KEY_INSTANCE_ID,
     KEY_MODEL,
@@ -22,30 +23,33 @@ from swebench.harness.constants import (
 )
 from swebench.harness.docker_build import close_logger
 from swebench.harness.utils import run_threadpool
-from swesmith.constants import KEY_PATCH, KEY_TIMED_OUT, TIMEOUT
+from swesmith.constants import HF_DATASET, KEY_PATCH, KEY_TIMED_OUT
 from swesmith.harness.grading import get_eval_report
 from swesmith.harness.utils import run_patch_in_container
+from swesmith.profiles import global_registry
 
 
 def run_evaluation(
     pred: dict,
     instance: dict,
     run_id: str,
+    f2p_only: bool = False,
     is_gold: bool = False,
-    timeout: int = TIMEOUT,
 ) -> None:
     """
     Run per-prediction evaluation
     """
     instance_id = pred[KEY_INSTANCE_ID]
+    rp = global_registry.get_from_inst(instance)
     logger, timed_out = run_patch_in_container(  # type: ignore
         instance,
         run_id,
         RUN_EVALUATION_LOG_DIR,
+        rp.timeout,
         patch=pred[KEY_PREDICTION],
-        commit=instance["base_commit"],
+        commit=instance_id,
+        f2p_only=f2p_only,
         is_gold=is_gold,
-        timeout=timeout,
     )
 
     eval_folder = RUN_EVALUATION_LOG_DIR / run_id
@@ -55,7 +59,7 @@ def run_evaluation(
     if timed_out:
         logger.info(f"Timed out for {instance_id}.")
         with open(report_path, "w") as f:
-            f.write(json.dumps({KEY_TIMED_OUT: True, "timeout": timeout}, indent=4))
+            f.write(json.dumps({KEY_TIMED_OUT: True, "timeout": rp.timeout}, indent=4))
         close_logger(logger)
         return
 
@@ -67,7 +71,7 @@ def run_evaluation(
     # Get report from test output
     logger.info(f"Grading answer for {instance_id}...")
     eval_folder = RUN_EVALUATION_LOG_DIR / run_id
-    report = get_eval_report(pred, instance, test_log_path)
+    report = get_eval_report(pred, instance, test_log_path, f2p_only=f2p_only)
     report[KEY_MODEL] = pred[KEY_MODEL]
 
     # Write report to report.json
@@ -77,13 +81,13 @@ def run_evaluation(
 
 
 def main(
-    dataset_path: str,
-    predictions_path: str,
     run_id: str,
-    max_workers: int,
+    workers: int,
+    predictions_path: str = "gold",
+    dataset_path: str = HF_DATASET,
+    f2p_only: bool = False,
     instance_ids: list | None = None,
     report_only: bool = False,
-    timeout: int = TIMEOUT,
     redo_existing: bool = False,
 ):
     """
@@ -91,25 +95,40 @@ def main(
     """
     assert len(run_id) > 0, "Run ID must be provided"
 
+    # Get dataset
+    if dataset_path.endswith(".json"):
+        with open(dataset_path) as f:
+            dataset = json.load(f)
+    elif dataset_path.endswith(".jsonl"):
+        with open(dataset_path) as f:
+            dataset = [json.loads(x) for x in f]
+    elif dataset_path == HF_DATASET:
+        dataset = load_dataset(dataset_path, split="train")
+    else:
+        raise ValueError("Dataset must be in .json or .jsonl format")
+    dataset = {x[KEY_INSTANCE_ID]: x for x in dataset}
+
     # Get predictions
     predictions = None
     is_gold = False
     if predictions_path == "gold":
         is_gold = True
         predictions = {
-            x[KEY_INSTANCE_ID]: {
-                KEY_INSTANCE_ID: x[KEY_INSTANCE_ID],
-                KEY_PREDICTION: x[KEY_PATCH],
+            inst_id: {
+                KEY_INSTANCE_ID: inst_id,
+                KEY_PREDICTION: inst[KEY_PATCH],
                 KEY_MODEL: "gold",
             }
-            for x in json.load(open(dataset_path))
+            for inst_id, inst in dataset.items()
         }
         print("Using gold predictions for eval (ignoring `predictions_path` argument)")
     else:
         if predictions_path.endswith(".json"):
-            predictions = json.load(open(predictions_path))
+            with open(predictions_path) as f:
+                predictions = json.load(f)
         elif predictions_path.endswith(".jsonl"):
-            predictions = [json.loads(x) for x in open(predictions_path)]
+            with open(predictions_path) as f:
+                predictions = [json.loads(x) for x in f]
             predictions = {x[KEY_INSTANCE_ID]: x for x in predictions}
         else:
             raise ValueError("Predictions must be in .json or .jsonl format")
@@ -123,16 +142,6 @@ def main(
     if len(predictions) == 0:
         print("No predictions to evaluate.")
         return
-
-    # Get dataset
-    dataset = None
-    if dataset_path.endswith(".json"):
-        dataset = json.load(open(dataset_path))
-    elif dataset_path.endswith(".jsonl"):
-        dataset = [json.loads(x) for x in open(dataset_path)]
-    else:
-        raise ValueError("Dataset must be in .json or .jsonl format")
-    dataset = {x[KEY_INSTANCE_ID]: x for x in dataset}
 
     # Create logging directory
     log_dir_parent = RUN_EVALUATION_LOG_DIR / run_id
@@ -160,8 +169,8 @@ def main(
                 prediction,
                 instance,
                 run_id,
+                f2p_only,
                 is_gold,
-                timeout,
             )
         )
 
@@ -169,7 +178,7 @@ def main(
     if report_only:
         print("Regenerating reports only (skipping eval run)")
     else:
-        run_threadpool(run_evaluation, payloads, max_workers)
+        run_threadpool(run_evaluation, payloads, workers)
         print("All instances run.")
 
     # Get number of task instances resolved
@@ -180,7 +189,8 @@ def main(
         report_path = log_dir_parent / instance_id / LOG_REPORT
         if not report_path.exists():
             continue
-        report = json.load(open(report_path))
+        with open(report_path) as f:
+            report = json.load(f)
         resolved = report.get("resolved", False)
         num_resolved += resolved
         if resolved:
@@ -206,14 +216,15 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Evaluate predications on SWEFT bugs")
-    parser.add_argument("--dataset_path", type=str, help="Path to dataset")
-    parser.add_argument("--predictions_path", type=str, help="Path to predictions")
-    parser.add_argument("--run_id", type=str, help="Unique identifier for this run")
     parser.add_argument(
-        "--max_workers", type=int, help="Number of workers to use", default=4
+        "-d", "--dataset_path", type=str, help="Path to dataset", default=HF_DATASET
     )
     parser.add_argument(
-        "--timeout", type=int, help="Timeout for each evaluation", default=TIMEOUT * 4
+        "-p", "--predictions_path", type=str, help="Path to predictions", default="gold"
+    )
+    parser.add_argument("--run_id", type=str, help="Unique identifier for this run")
+    parser.add_argument(
+        "-w", "--workers", type=int, help="Number of workers to use", default=4
     )
     parser.add_argument(
         "--redo_existing",
@@ -221,7 +232,13 @@ if __name__ == "__main__":
         help="Redo completed evaluation instances",
     )
     parser.add_argument(
-        "--instance_ids", type=str, help="Instance IDs to evaluate", nargs="+"
+        "-i", "--instance_ids", type=str, help="Instance IDs to evaluate", nargs="+"
+    )
+    parser.add_argument(
+        "-f",
+        "--f2p_only",
+        action="store_true",
+        help="(Speed up) Run evaluation using only files with f2p tests",
     )
     parser.add_argument(
         "--report_only", action="store_true", help="Regenerate reports only"
