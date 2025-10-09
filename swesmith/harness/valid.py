@@ -75,12 +75,19 @@ def run_validation(
 
     if run_min_pregold:
         ref_inst_id = f"{instance[KEY_INSTANCE_ID]}{REF_SUFFIX}"
-        logger, timed_out = run_patch_in_container(
+        result = run_patch_in_container(
             {**instance, KEY_INSTANCE_ID: ref_inst_id},
             run_id,
             LOG_DIR_RUN_VALIDATION,
             timeout=timeout,
         )
+        if result is None:
+            # Container run failed with exception
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(report_path, "w") as f:
+                f.write(json.dumps({"error": "Pre-gold container run failed"}, indent=4))
+            return
+        logger, timed_out = result
         close_logger(logger)
         if timed_out:
             logger.info(f"Timed out (pre-gold) for {instance_id}.")
@@ -93,19 +100,33 @@ def run_validation(
         # Copy pre-gold test output to the post-gold folder and remove the pre-gold folder
         val_postgold_path = valid_folder / instance_id / LOG_TEST_OUTPUT_PRE_GOLD
         val_postgold_path.parent.mkdir(parents=True, exist_ok=True)
+        ref_test_output = valid_folder / ref_inst_id / LOG_TEST_OUTPUT
+        if not ref_test_output.exists():
+            logger.error(f"Reference test output not found at {ref_test_output}")
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(report_path, "w") as f:
+                f.write(json.dumps({"error": "Reference test output not found"}, indent=4))
+            return
         shutil.copy(
-            valid_folder / ref_inst_id / LOG_TEST_OUTPUT,
+            ref_test_output,
             val_postgold_path,
         )
         shutil.rmtree(valid_folder / ref_inst_id)
 
-    logger, timed_out = run_patch_in_container(
+    result = run_patch_in_container(
         instance,
         run_id,
         LOG_DIR_RUN_VALIDATION,
         patch=instance[KEY_PATCH],
         timeout=timeout,
     )
+    if result is None:
+        # Container run failed with exception
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(report_path, "w") as f:
+            f.write(json.dumps({"error": "Patched container run failed"}, indent=4))
+        return
+    logger, timed_out = result
 
     if timed_out:
         logger.info(f"Timed out for {instance_id}.")
